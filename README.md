@@ -47,4 +47,4 @@ src/
 
 hardware/
   wiring_diagram.png      # Main wiring diagram
-  components_list.md      # List of all components
+  CAD files      # used to 3D print the board
