@@ -1,0 +1,102 @@
+#include <Arduino.h>
+#include <ESP32Servo.h>
+
+// ===================== PINS =====================
+#define SELECT_1 21   // PWM input: which servo (from other ESP)
+#define SELECT_2 16   // PWM input: which servo (from other ESP)
+#define SELECT_3 17   // PWM input: which servo (from other ESP)
+#define SELECT_4 12   // PWM input: which servo (from other ESP)
+#define DIR_IN    22   // digital input: direction (HIGH = back, LOW = forward)
+const int SERVO_PINS[4] = {18, 25, 26, 14};
+
+// ===================== SERVO CONFIG =====================
+Servo servos[4];
+int STOP_ANGLE[4]  = {90, 90, 90, 90};   // adjust if a servo creeps
+int SPEED_DELTA[4] = {40, 40, 40, 40};   // movement distance from stop
+
+
+
+
+// ===================== SETUP =====================
+void setup() {
+
+  pinMode(SELECT_1, INPUT);
+  pinMode(SELECT_2, INPUT);
+  pinMode(SELECT_3, INPUT);
+  pinMode(SELECT_4, INPUT);
+  pinMode(DIR_IN, INPUT);
+
+  // attach all servos
+  for (int i = 0; i < 4; i++) {
+    servos[i].setPeriodHertz(50);
+    servos[i].attach(SERVO_PINS[i], 1000, 2000);
+    servos[i].write(STOP_ANGLE[i]);
+  }
+}
+
+// ===================== LOOP =====================
+void loop() {
+  int duty1 = digitalRead(SELECT_1);
+  int duty2 = digitalRead(SELECT_2);
+  int duty3 = digitalRead(SELECT_3);
+  int duty4 = digitalRead(SELECT_4);
+  int dirState  = digitalRead(DIR_IN);   // HIGH = fwd, LOW = back
+
+  if (duty1 == HIGH && dirState == HIGH) {
+    servos[0].write(STOP_ANGLE[0]-SPEED_DELTA[0]);
+    servos[1].write(STOP_ANGLE[1]); // ensure others are stopped
+    servos[2].write(STOP_ANGLE[2]);
+    servos[3].write(STOP_ANGLE[3]);
+  }
+  else if (duty1 == HIGH && dirState == LOW) {
+    servos[0].write(STOP_ANGLE[0]+SPEED_DELTA[0]);
+    servos[1].write(STOP_ANGLE[1]); // ensure others are stopped
+    servos[2].write(STOP_ANGLE[2]);
+    servos[3].write(STOP_ANGLE[3]);
+  }
+  else if (duty2 == HIGH && dirState == HIGH) {
+    servos[1].write(STOP_ANGLE[1]-SPEED_DELTA[1]);
+    servos[0].write(STOP_ANGLE[0]); // ensure others are stopped
+    servos[2].write(STOP_ANGLE[2]); 
+    servos[3].write(STOP_ANGLE[3]);
+  }
+  else if (duty2 == HIGH && dirState == LOW) {
+    servos[1].write(STOP_ANGLE[1]+SPEED_DELTA[1]);
+    servos[0].write(STOP_ANGLE[0]); // ensure others are stopped
+    servos[2].write(STOP_ANGLE[2]); 
+    servos[3].write(STOP_ANGLE[3]);
+  }
+  else if (duty3 == HIGH && dirState == HIGH) {
+    servos[2].write(STOP_ANGLE[2]-SPEED_DELTA[2]);
+    servos[0].write(STOP_ANGLE[0]); // ensure others are stopped
+    servos[1].write(STOP_ANGLE[1]);
+    servos[3].write(STOP_ANGLE[3]);
+  }
+  else if (duty3 == HIGH && dirState == LOW) {
+    servos[2].write(STOP_ANGLE[2]+SPEED_DELTA[2]);
+    servos[0].write(STOP_ANGLE[0]); // ensure others are stopped
+    servos[1].write(STOP_ANGLE[1]);
+    servos[3].write(STOP_ANGLE[3]);
+  }
+  else if (duty4 == HIGH && dirState == HIGH) {
+    servos[3].write(STOP_ANGLE[3]-SPEED_DELTA[3]);
+    servos[0].write(STOP_ANGLE[0]); // ensure others are stopped
+    servos[1].write(STOP_ANGLE[1]);
+    servos[2].write(STOP_ANGLE[2]);
+  }
+  else if (duty4 == HIGH && dirState == LOW) {
+    servos[3].write(STOP_ANGLE[3]+SPEED_DELTA[3]);
+    servos[0].write(STOP_ANGLE[0]); // ensure others are stopped
+    servos[1].write(STOP_ANGLE[1]);
+    servos[2].write(STOP_ANGLE[2]);
+  }
+  else {
+    // stop all servos
+    for (int i = 0; i < 4; i++) {
+      servos[i].write(STOP_ANGLE[i]);
+    }
+  }
+
+
+  delay(100);
+}
