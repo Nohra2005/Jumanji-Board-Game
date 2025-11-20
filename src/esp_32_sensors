@@ -1,0 +1,110 @@
+#include <Arduino.h>
+#include <Adafruit_NeoPixel.h>
+
+// -------- Ultrasonic pins --------
+#define TRIG_PIN1 21
+#define ECHO_PIN1 22
+#define TRIG_PIN2 18
+#define ECHO_PIN2 19
+#define TRIG_PIN3 16
+#define ECHO_PIN3 17
+#define TRIG_PIN4 25
+#define ECHO_PIN4 26
+
+// -------- NeoPixel (3 LEDs per strip) on 4 different pins --------
+#define LED_PIN1  4
+#define LED_PIN2  13
+#define LED_PIN3  27
+#define LED_PIN4  14
+#define LED_COUNT 3
+
+// Indicator that all sensors are within range
+#define startPin  23
+
+int mainDistance = 50; // cm threshold
+
+// Create 4 NeoPixel objects (one per strip/pin)
+Adafruit_NeoPixel strip1(LED_COUNT, LED_PIN1, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel strip2(LED_COUNT, LED_PIN2, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel strip3(LED_COUNT, LED_PIN3, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel strip4(LED_COUNT, LED_PIN4, NEO_GRB + NEO_KHZ800);
+
+// Helper to set entire strip to one color and show
+void setStrip(Adafruit_NeoPixel &s, uint8_t r, uint8_t g, uint8_t b) {
+  uint32_t c = s.Color(r, g, b);
+  for (int i = 0; i < LED_COUNT; i++) s.setPixelColor(i, c);
+  s.show();
+}
+
+// Trigger & read one ultrasonic sensor (returns cm, or -1 if timeout)
+float readDistanceCM(uint8_t trigPin, uint8_t echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  // timeout ~25 ms (≈ 4+ meters)
+  long duration = pulseIn(echoPin, HIGH, 25000);
+  if (duration <= 0) return -1.0f;
+
+  return duration * 0.0343f / 2.0f;
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(startPin, OUTPUT);
+  digitalWrite(startPin, LOW);
+
+  pinMode(TRIG_PIN1, OUTPUT); pinMode(ECHO_PIN1, INPUT);
+  pinMode(TRIG_PIN2, OUTPUT); pinMode(ECHO_PIN2, INPUT);
+  pinMode(TRIG_PIN3, OUTPUT); pinMode(ECHO_PIN3, INPUT);
+  pinMode(TRIG_PIN4, OUTPUT); pinMode(ECHO_PIN4, INPUT);
+
+  // Init NeoPixel strips
+  strip1.begin(); strip1.setBrightness(60); setStrip(strip1, 0,0,0);
+  strip2.begin(); strip2.setBrightness(60); setStrip(strip2, 0,0,0);
+  strip3.begin(); strip3.setBrightness(60); setStrip(strip3, 0,0,0);
+  strip4.begin(); strip4.setBrightness(60); setStrip(strip4, 0,0,0);
+
+  Serial.println("Ultrasonic + NeoPixel (4x) test starting…");
+}
+
+void loop() {
+  // Read each sensor (small spacing to reduce crosstalk)
+  float d1 = readDistanceCM(TRIG_PIN1, ECHO_PIN1); delay(30);
+  float d2 = readDistanceCM(TRIG_PIN2, ECHO_PIN2); delay(30);
+  float d3 = readDistanceCM(TRIG_PIN3, ECHO_PIN3); delay(30);
+  float d4 = readDistanceCM(TRIG_PIN4, ECHO_PIN4); // no need to delay after last
+
+  // Debug
+  Serial.print("D1="); Serial.print(d1);
+  Serial.print("  D2="); Serial.print(d2);
+  Serial.print("  D3="); Serial.print(d3);
+  Serial.print("  D4="); Serial.println(d4);
+
+  // Light each strip GREEN if within range, else OFF
+  if (d1 > 0 && d1 < mainDistance) setStrip(strip1, 0,255,0); else setStrip(strip1, 0,0,0);
+  if (d2 > 0 && d2 < mainDistance) setStrip(strip2, 0,255,0); else setStrip(strip2, 0,0,0);
+  if (d3 > 0 && d3 < mainDistance) setStrip(strip3, 0,255,0); else setStrip(strip3, 0,0,0);
+  if (d4 > 0 && d4 < mainDistance) setStrip(strip4, 0,255,0); else setStrip(strip4, 0,0,0);
+
+  // If ALL four are within range → raise startPin HIGH (and optionally make all strips BLUE)
+  bool allIn =
+    (d1 > 0 && d1 < mainDistance) &&
+    (d2 > 0 && d2 < mainDistance) &&
+    (d3 > 0 && d3 < mainDistance) &&
+    (d4 > 0 && d4 < mainDistance);
+
+  if (allIn) {
+    digitalWrite(startPin, HIGH);
+    // Optional: show BLUE on all when "ready"
+    // setStrip(strip1, 0,0,255); setStrip(strip2, 0,0,255);
+    // setStrip(strip3, 0,0,255); setStrip(strip4, 0,0,255);
+  } else {
+    digitalWrite(startPin, LOW);
+  }
+
+  delay(100);
+}
