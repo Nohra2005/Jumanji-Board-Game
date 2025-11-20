@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+# Run with:
+#   source ~/bleenv/bin/activate
+#   python3 ~/ble_listen_die.py
+
+import asyncio, json, time, os
+from bleak import BleakScanner, BleakClient
+
+ADDRESS = "98:A3:16:F7:63:CD"
+SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+CHAR_UUID_ROLL = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+
+QUEUE_PATH = "/tmp/jumanji_rolls.jsonl"
+LATEST_PATH = "/tmp/jumanji_latest_roll.txt"
+ALLOWED = {"1", "2", "3", "-1", "challenge", "trivia"}
+
+os.makedirs("/tmp", exist_ok=True)
+
+def save_roll(text: str):
+    ts = time.time()
+    with open(QUEUE_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": ts, "roll": text}, ensure_ascii=False) + "\n")
+    with open(LATEST_PATH, "w", encoding="utf-8") as f:
+        f.write(text)
+    print(f"Roll: {text}", flush=True)
+
+def decode_payload(data: bytes) -> str:
+    try:
+        s = data.decode("utf-8").strip()
+        return s if s in ALLOWED else ""
+    except Exception:
+        return ""
+
+async def connect_once(address: str):
+    # Exactly like before: short scan to refresh cache
+    print("Scan 2s to refresh cache...", flush=True)
+    try:
+        await BleakScanner.discover(timeout=2.0)
+    except Exception:
+        pass
+
+    print(f"Connecting to {address} ...", flush=True)
+    async with BleakClient(address, timeout=10.0) as client:
+        # Your original warmup: start dummy notify, stop, then real notify
+        await client.start_notify(CHAR_UUID_ROLL, lambda *_: None)
+
+        def cb(_, data: bytearray):
+            text = decode_payload(bytes(data))
+            if text:
+                save_roll(text)
+
+        await client.stop_notify(CHAR_UUID_ROLL)    # ensure fresh (your trick)
+        await client.start_notify(CHAR_UUID_ROLL, cb)
+
+        print("Connected. Subscribed. Listening (Ctrl+C to stop).", flush=True)
+
+        # Minimal “watch” without changing flow: leave as soon as we drop
+        while True:
+            if not client.is_connected:
+                raise RuntimeError("Disconnected")
+            await asyncio.sleep(0.5)
+
+async def main():
+    global ADDRESS
+    while True:
+        try:
+            await connect_once(ADDRESS)
+        except asyncio.TimeoutError:
+            print("Connect timed out.", flush=True)
+        except Exception as e:
+            print(f"Connect failed: {e}", flush=True)
+            # Quick rescan to refresh cache and update MAC if needed
+            try:
+                print("Quick rescan 2s ...", flush=True)
+                devs = await BleakScanner.discover(timeout=2.0)
+                for d in devs:
+                    if (d.name or "").strip() == "JUMANJI_DIE":
+                        if d.address != ADDRESS:
+                            print(f"Updating MAC to {d.address}", flush=True)
+                            ADDRESS = d.address
+                        break
+            except Exception:
+                pass
+        # Fast retry
+        await asyncio.sleep(0.5)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Stopped.", flush=True)
