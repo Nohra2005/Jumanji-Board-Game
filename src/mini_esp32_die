@@ -1,0 +1,194 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <NimBLEDevice.h>
+#include <math.h>
+
+// ===== Config =====
+static const bool  INVERT_Y       = false;  // <- try false first; set true if 3/-1 are flipped
+static const float G_SI           = 9.80665f;
+static const float ACC_SHAKE_G    = 1.40f;
+static const float GYRO_SHAKE_DPS = 80.0f;
+static const float GYRO_STILL_DPS = 15.0f;
+static const float ACC_NEAR_1G    = 0.20f;
+static const uint32_t SETTLE_MS   = 800;
+static const uint8_t  AVG_SAMPLES = 18;
+static const float DOM_THRESH     = 0.78f;  // axis must be >= 0.78 of |g| (~38° cone)
+
+// ===== UUIDs =====
+static NimBLEUUID SERVICE_UUID   ("6e400001-b5a3-f393-e0a9-e50e24dcca9e");
+static NimBLEUUID CHAR_UUID_ROLL ("6e400003-b5a3-f393-e0a9-e50e24dcca9e");
+
+// ===== Globals =====
+Adafruit_MPU6050 mpu;
+NimBLECharacteristic* rollChr = nullptr;
+volatile bool connected = false;
+
+// ===== Helpers =====
+static inline float mag3(float x,float y,float z){ return sqrtf(x*x+y*y+z*z); }
+
+static void imuGet(sensors_event_t& a, sensors_event_t& g, sensors_event_t& t){
+  mpu.getEvent(&a,&g,&t);
+}
+
+static bool detectShake(){
+  sensors_event_t a,g,t; imuGet(a,g,t);
+  float accMagG = mag3(a.acceleration.x,a.acceleration.y,a.acceleration.z)/G_SI;
+  float gyroMag = mag3(g.gyro.x,g.gyro.y,g.gyro.z)*57.2958f;
+  bool shakeDetected = (accMagG>ACC_SHAKE_G) || (gyroMag>GYRO_SHAKE_DPS);
+  if (shakeDetected) {
+    Serial.printf("[IMU] Shake detected! acc=%.2fg gyro=%.1fdps\n", accMagG, gyroMag);
+  }
+  return shakeDetected;
+}
+
+static bool waitForSettle(uint32_t timeoutMs=5000){
+  Serial.println("[IMU] Waiting for settle...");
+  uint32_t start=millis(), stillStart=0; bool inStill=false;
+  while (millis()-start<timeoutMs){
+    sensors_event_t a,g,t; imuGet(a,g,t);
+    float accMagG = mag3(a.acceleration.x,a.acceleration.y,a.acceleration.z)/G_SI;
+    float gyroMag = mag3(g.gyro.x,g.gyro.y,g.gyro.z)*57.2958f;
+    bool near1g = fabsf(accMagG-1.0f)<=ACC_NEAR_1G;
+    bool lowGyro= gyroMag<=GYRO_STILL_DPS;
+
+    if (near1g && lowGyro){
+      if(!inStill){ inStill=true; stillStart=millis(); }
+      else if(millis()-stillStart>=SETTLE_MS){
+        Serial.println("[IMU] Settled!");
+        return true;
+      }
+    } else {
+      if(inStill) Serial.println("[IMU] Motion resumed before settle.");
+      inStill=false;
+    }
+    delay(10);
+  }
+  Serial.println("[IMU] Settle timeout.");
+  return false;
+}
+
+static String faceFromGravity(){
+  Serial.println("[IMU] Reading face orientation...");
+  float ax=0,ay=0,az=0;
+  for(uint8_t i=0;i<AVG_SAMPLES;i++){
+    sensors_event_t a,g,t; imuGet(a,g,t);
+    ax+=a.acceleration.x; ay+=a.acceleration.y; az+=a.acceleration.z; delay(8);
+  }
+  ax/=AVG_SAMPLES; ay/=AVG_SAMPLES; az/=AVG_SAMPLES;
+
+  float m=mag3(ax,ay,az); if(m<1e-6f) m=1e-6f;
+  float nx=ax/m, ny=ay/m, nz=az/m;
+  Serial.printf("[IMU] Normalized vector: X=%.2f Y=%.2f Z=%.2f\n", nx, ny, nz);
+
+  float absx=fabsf(nx), absy=fabsf(ny), absz=fabsf(nz);
+
+  // re-sample if ambiguous
+  if (absx<DOM_THRESH && absy<DOM_THRESH && absz<DOM_THRESH) {
+    Serial.println("[IMU] Weak gravity vector, re-sampling...");
+    delay(120);
+    ax=ay=az=0;
+    for(uint8_t i=0;i<AVG_SAMPLES;i++){
+      sensors_event_t a,g,t; imuGet(a,g,t);
+      ax+=a.acceleration.x; ay+=a.acceleration.y; az+=a.acceleration.z; delay(8);
+    }
+    ax/=AVG_SAMPLES; ay/=AVG_SAMPLES; az/=AVG_SAMPLES;
+    m=mag3(ax,ay,az); if(m<1e-6f) m=1e-6f;
+    nx=ax/m; ny=ay/m; nz=az/m;
+    absx=fabsf(nx); absy=fabsf(ny); absz=fabsf(nz);
+  }
+
+  String face;
+  if (absx>=absy && absx>=absz) {
+    face = (nx>0) ? "1" : "2";
+  } else if (absy>=absx && absy>=absz) {
+    if (INVERT_Y)  face = (ny>0) ? "-1" : "3";
+    else           face = (ny>0) ? "3"  : "-1";
+  } else {
+    face = (nz>0) ? "challenge" : "trivia";
+  }
+
+  Serial.print("[IMU] Face determined as: ");
+  Serial.println(face);
+  return face;
+}
+
+// ===== BLE =====
+class Cbs: public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer*) override {
+    connected=true;
+    Serial.println("[BLE] Central connected!");
+  }
+  void onDisconnect(NimBLEServer*) override {
+    connected=false;
+    Serial.println("[BLE] Central disconnected, restarting advertising.");
+    NimBLEDevice::startAdvertising();
+  }
+};
+
+void setup(){
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("\n=== JUMANJI_DIE starting ===");
+
+  Wire.begin();
+  if(!mpu.begin()){
+    Serial.println("[IMU] MPU6050 not found!");
+    while(1) delay(1000);
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  Serial.println("[IMU] MPU6050 initialized.");
+
+  NimBLEDevice::init("JUMANJI_DIE");
+  NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_PUBLIC);
+  NimBLEDevice::setSecurityAuth(false,false,false);
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+
+  auto server = NimBLEDevice::createServer();
+  server->setCallbacks(new Cbs());
+
+  auto svc = server->createService(SERVICE_UUID);
+  rollChr = svc->createCharacteristic(
+      CHAR_UUID_ROLL,
+      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
+  );
+  rollChr->setValue("ready");
+  svc->start();
+
+  auto adv = NimBLEDevice::getAdvertising();
+  adv->addServiceUUID(SERVICE_UUID);
+  adv->setScanResponse(true);
+  adv->setName("JUMANJI_DIE");
+  adv->start();
+
+  Serial.println("[BLE] Advertising started as: JUMANJI_DIE");
+  Serial.print("[BLE] MAC address: ");
+  Serial.println(NimBLEDevice::getAddress().toString().c_str());
+}
+
+void loop(){
+  if(!connected){
+    static uint32_t last=0;
+    if(millis()-last>2000){
+      Serial.println("[BLE] Waiting for connection...");
+      last=millis();
+    }
+    delay(30);
+    return;
+  }
+
+  if(detectShake() && waitForSettle()){
+    String outcome = faceFromGravity();
+    const char* s = outcome.c_str();
+    rollChr->setValue((uint8_t*)s, strlen(s));
+    rollChr->notify();
+    Serial.print("[BLE] Notified outcome: ");
+    Serial.println(s);
+    delay(450);
+  }
+  delay(20);
+}
