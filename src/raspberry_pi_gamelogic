@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+# gamelogic.py — full file (restored + consolidated)
+# • Natural voice via gTTS→ffmpeg→aplay
+# • ESP32 start-gate on a single GPIO (BCM17)
+# • Two buttons on BCM4 and BCM26 (active-LOW to GND)
+# • Challenge: 1 minute to press a button → success; else reset to start
+# • Trivia: 3 options (A/B/C); 1/2/3 clicks in 1 minute; wrong/timeout resets to start
+# • Win condition: position >= 5 ends the game with congrats
+
+import os, sys, time, json, random, subprocess, shutil, re
+
+# ----------------- SETTINGS -----------------
+TEST_MODE = False            # True: type rolls manually in console
+REQUIRE_4_PLAYERS = False     # True: wait for ESP32 start signal on START_PIN
+TURNS_MAX = 9999
+PLAYERS = ["P1", "P2", "P3", "P4"]
+ALLOWED  = {"1","2","3","-1","challenge","trivia"}
+
+# Paths written by your BLE listener (queue for rolls)
+QUEUE_PATH  = "/tmp/jumanji_rolls.jsonl"          # append-only queue
+LATEST_PATH = "/tmp/jumanji_latest_roll.txt"      # (optional) last roll only
+
+# Gemini
+GEMINI_MODEL   = "gemini-2.5-flash"
+GOOGLE_API_KEY = "AIzaSyAzZ4WmrihxILI_904vDqDcH7f0yRSJvNY"
+
+# ----------------- GPIO PINS -----------------
+START_PIN   = 17         # ESP32 -> Pi signal (BCM17, physical pin 11)
+BUTTON_PINS = [4, 26]    # Buttons to GND (active-LOW), internal pull-ups
+
+# ----------------- AUDIO (gTTS -> ffmpeg -> aplay) -----------------
+ALSA_DEV = "plughw:1,0"  # if needed, try "default" or "plughw:0,0"
+TTS_TLD  = "com.au"      # gTTS accent domain
+FFMPEG_FILTERS = (
+    "highpass=200,"
+    "lowpass=6500,"
+    "equalizer=f=3000:t=h:width=2000:g=6,"
+    "loudnorm=I=-16:TP=-1.5:LRA=11,"
+    "atempo=1.05"
+)
+
+def speak(text: str):
+    text = (text or "").strip()
+    if not text:
+        return
+    if not shutil.which("ffmpeg"):
+        print(f"🔇 ffmpeg missing; cannot speak: {text}")
+        return
+    try:
+        from gtts import gTTS
+    except Exception as e:
+        print(f"🔇 gTTS not available ({e}); cannot speak: {text}")
+        return
+
+    ts  = int(time.time()*1000)
+    mp3 = f"/tmp/say_{ts}.mp3"
+    wav = f"/tmp/say_{ts}.wav"
+    try:
+        gTTS(text=text, lang="en", slow=False, tld=TTS_TLD).save(mp3)
+        cmd = ["ffmpeg","-y","-hide_banner","-loglevel","error","-i", mp3,
+               "-ar","48000","-ac","1"]
+        if FFMPEG_FILTERS:
+            cmd += ["-af", FFMPEG_FILTERS]
+        cmd += [wav]
+        subprocess.run(cmd, check=True)
+        subprocess.run(["aplay","-q","-D", ALSA_DEV, wav], check=False)
+    except Exception as e:
+        print(f"🔇 speak() error: {e}")
+    finally:
+        for p in (mp3, wav):
+            try: os.remove(p)
+            except: pass
+
+# ----------------- Optional: Gemini -----------------
+def ask_gemini(prompt: str) -> str:
+    key = (GOOGLE_API_KEY or "").strip()
+    if not key or not key.startswith("AIza"):
+        return "(Gemini key missing/invalid)"
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=key)
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        resp = model.generate_content(prompt)
+        return (getattr(resp, "text", "") or "(No answer)").strip()
+    except Exception as e:
+        return f"(Gemini error: {e})"
+
+# ----------------------------------------------------------
+# ---------- Start-gate via ESP32 (single GPIO) ----------
+def wait_for_start_signal(timeout_s: int = 90, stable_ms: int = 300) -> bool:
+    """Wait for a HIGH level from the ESP32 on START_PIN to indicate that
+    four players are detected. Requires shared GND between ESP32 and Pi.
+
+    - ESP32 should drive 3.3V logic HIGH (safe for the Pi).
+    - We enable an internal pull-down so the line idles LOW.
+    - 'stable_ms' requires the line to stay HIGH continuously for that long.
+    """
+    if not REQUIRE_4_PLAYERS:
+        print("▶ Skipping player detection (REQUIRE_4_PLAYERS=False).")
+        return True
+    try:
+        import RPi.GPIO as GPIO
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(START_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+
+        print(f"⏳ Waiting for ESP32 start signal on BCM{START_PIN} (pin 11)…")
+        speak("Waiting for four adventurers.")
+
+        start = time.time()
+        hi_since = None
+        while time.time() - start < timeout_s:
+            if GPIO.input(START_PIN):
+                if hi_since is None:
+                    hi_since = time.time()
+                elif (time.time() - hi_since) * 1000 >= stable_ms:
+                    print("✅ Start signal received from ESP32.")
+                    speak("All players present. The game begins.")
+                    GPIO.cleanup(START_PIN)
+                    return True
+            else:
+                hi_since = None
+            time.sleep(0.02)
+        print("⌛ Timeout waiting for start signal. Starting anyway.")
+        speak("Starting anyway.")
+        GPIO.cleanup(START_PIN)
+        return True
+
+    except Exception as e:
+        print(f"⚠️ GPIO input unavailable ({e}). Starting without start gate.")
+        return True
+
+# ----------------------------------------------------------
+# ---------- Buttons / Clicks ----------
+
+def wait_for_any_button(button_pins=BUTTON_PINS, timeout_s=60, debounce_ms=50):
+    """Wait for any of the listed buttons to be pressed (active-LOW) within timeout.
+    Returns the BCM pin number that was pressed, or None on timeout/unavailable.
+    """
+    try:
+        import RPi.GPIO as GPIO
+        GPIO.setmode(GPIO.BCM)
+        for p in button_pins:
+            GPIO.setup(p, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        start = time.time()
+        while time.time() - start < timeout_s:
+            for p in button_pins:
+                if GPIO.input(p) == GPIO.LOW:
+                    time.sleep(debounce_ms/1000.0)
+                    if GPIO.input(p) == GPIO.LOW:
+                        print(f"🔘 Button on BCM{p} pressed.")
+                        return p
+            time.sleep(0.01)
+        return None
+    except Exception as e:
+        print(f"⚠️ Button check unavailable ({e}). Treating as no press.")
+        return None
+
+def wait_for_click_count(button_pins=BUTTON_PINS, timeout_s=60, click_gap_ms=800, debounce_ms=60, max_clicks=3):
+    """Wait up to `timeout_s` for a sequence of 1..max_clicks presses on ANY button (active-LOW).
+    Each press must be no more than `click_gap_ms` after the previous press.
+    Returns 1..max_clicks, or None on timeout/no valid sequence.
+    """
+    try:
+        import RPi.GPIO as GPIO
+        GPIO.setmode(GPIO.BCM)
+        for p in button_pins:
+            GPIO.setup(p, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        start = time.time()
+        count = 0
+        last_press_ts = None
+        while time.time() - start < timeout_s:
+            now = time.time()
+            # If a sequence started and the gap expired, accept it
+            if count > 0 and last_press_ts and (now - last_press_ts) * 1000 > click_gap_ms:
+                return min(count, max_clicks)
+            for p in button_pins:
+                if GPIO.input(p) == GPIO.LOW:
+                    time.sleep(debounce_ms/1000.0)
+                    if GPIO.input(p) == GPIO.LOW:
+                        # wait for release so a long hold isn't counted multiple times
+                        while GPIO.input(p) == GPIO.LOW:
+                            time.sleep(0.005)
+                        count += 1
+                        last_press_ts = time.time()
+                        print(f"🔘 Click {count} detected on BCM{p}.")
+                        if count >= max_clicks:
+                            return max_clicks
+            time.sleep(0.01)
+        # Timeout
+        return min(count, max_clicks) if count > 0 else None
+    except Exception as e:
+        print(f"⚠️ Click counter unavailable ({e}). Treating as no input.")
+        return None
+
+# ----------------------------------------------------------
+# ---------- Die roll intake ----------
+
+def ensure_tmp_files():
+    os.makedirs("/tmp", exist_ok=True)
+    try: open(QUEUE_PATH, "a").close()
+    except Exception: pass
+    try: open(LATEST_PATH, "a").close()
+    except Exception: pass
+
+def get_roll_from_keyboard() -> str:
+    while True:
+        s = input("Type a roll [1,2,3,-1,challenge,trivia]: ").strip()
+        if s in ALLOWED: return s
+        print("Invalid. Try again.")
+
+def get_roll_from_queue(block=True, poll_interval=0.3) -> str:
+    ensure_tmp_files()
+    with open(QUEUE_PATH, "r", encoding="utf-8") as f:
+        f.seek(0, os.SEEK_END)
+        while True:
+            pos = f.tell()
+            line = f.readline()
+            if not line:
+                if not block: return ""
+                time.sleep(poll_interval)
+                f.seek(pos)
+                continue
+            try:
+                rec = json.loads(line)
+                roll = str(rec.get("roll", "")).strip()
+                if roll in ALLOWED:
+                    return roll
+            except Exception:
+                pass
+
+def get_dice_roll() -> str:
+    return get_roll_from_keyboard() if TEST_MODE else get_roll_from_queue(block=True)
+
+# ----------------------------------------------------------
+# ---------- Game logic ----------
+
+class Game:
+    def __init__(self, players):
+        self.players   = players[:]
+        self.pos       = {p: 0 for p in players}
+        self.turn_idx  = 0
+
+    def current_player(self):
+        return self.players[self.turn_idx % len(self.players)]
+
+    def advance_turn(self):
+        self.turn_idx += 1
+
+    def apply_move(self, player, delta):
+        self.pos[player] += delta
+        if self.pos[player] < 0:
+            self.pos[player] = 0
+
+    def do_challenge(self, player):
+        q = "Give me a fast, fun physical mini-challenge suitable for a party (one sentence)."
+        ans = ask_gemini(q)
+        print(f"🤸 Challenge for {player}: {ans}")
+        speak(f"{player}, a challenge appears. {ans} You have one minute to complete it, then press your button.")
+
+        pressed = wait_for_any_button(BUTTON_PINS, timeout_s=60, debounce_ms=60)
+        if pressed is not None:
+            print(f"✅ {player} completed the challenge (button BCM{pressed}).")
+            speak("Challenge complete! Well done.")
+        else:
+            print(f"⏱️ {player} ran out of time. Challenge failed — back to start.")
+            speak("Time's up. Challenge failed. Return to the start.")
+            self.pos[player] = 0
+
+    def do_trivia(self, player):
+        q = ("Create a single short multiple-choice trivia question with exactly 3 options (A, B, C).\n"
+             "Format:\nQuestion\nA) ...\nB) ...\nC) ...\nAnswer: <A|B|C>")
+        raw = ask_gemini(q)
+        text = raw.strip() if raw else "(No question)"
+        print(f"🧠 Trivia for {player}:\n{text}")
+
+        speak(
+            f"{player}, trivia time. {text} "
+            "Click the button once for option A, twice for option B, and three times for option C. "
+            "You have one minute."
+        )
+
+        m = re.search(r"(?i)answer\s*[:\-]?\s*([ABC])", text)
+        correct = m.group(1).upper() if m else None
+
+        clicks = wait_for_click_count(BUTTON_PINS, timeout_s=60, click_gap_ms=800, debounce_ms=60, max_clicks=3)
+        if clicks is None:
+            speak("Time's up. No answer was recorded. Return to the start.")
+            print("⏱️ Trivia timeout — FAIL, resetting to start.")
+            self.pos[player] = 0
+            return
+
+        choice = {1: "A", 2: "B", 3: "C"}.get(clicks, None)
+        print(f"📝 {player} chose {choice} via {clicks} click(s). Correct: {correct}")
+
+        if correct and choice == correct:
+            speak("Correct! Nicely done.")
+        else:
+            if correct and choice is not None:
+                speak(f"Incorrect. The correct answer was {correct}. Return to the start.")
+            else:
+                speak("Answer recorded. Return to the start.")
+            self.pos[player] = 0
+
+    def handle_roll(self, player, roll):
+        if roll in {"1","2","3","-1"}:
+            delta = int(roll)
+            if roll == "-1":
+                print(f"↩️ {player} moves back 1.")
+                speak(f"{player} moves back one.")
+            else:
+                print(f"➡️ {player} moves forward {delta}.")
+                speak(f"{player} moves forward {delta}.")
+            self.apply_move(player, delta)
+            # Win condition (reach 5 or more)
+            if self.pos[player] >= 5:
+                speak(f"Congratulations {player}! You have reached the end and won Jumanji!")
+                print(f"🏆 {player} wins the game! 🎉")
+                raise SystemExit
+        elif roll == "challenge":
+            speak(f"{player} rolled a challenge.")
+            self.do_challenge(player)
+        elif roll == "trivia":
+            speak(f"{player} rolled trivia.")
+            self.do_trivia(player)
+        else:
+            print(f"⚠️ Unknown roll: {roll}")
+            speak("The spirits are confused.")
+
+        board = " | ".join(f"{p}:{self.pos[p]}" for p in self.players)
+        print(f"📍 Board -> {board}")
+
+# ----------------------------------------------------------
+# ---------- Main ----------
+
+def main():
+    print("🎮 Jumanji game starting…")
+    speak("Welcome to Jumanji.")
+    if REQUIRE_4_PLAYERS:
+        wait_for_start_signal()
+
+    game = Game(PLAYERS)
+    print("✅ Ready. Waiting for die rolls… (Ctrl+C to quit)")
+    print(f" TEST_MODE={'ON' if TEST_MODE else 'OFF'} Source={'/tmp jsonl' if not TEST_MODE else 'keyboard'}")
+    speak("Player one, roll the die.")
+
+    turns = 0
+    while turns < TURNS_MAX:
+        try:
+            player = game.current_player()
+            print(f"\n— Turn {turns+1}: {player} —")
+            speak(f"It is {player}'s turn.")
+            roll = get_dice_roll()
+            print(f"🎲 Roll: {roll}")
+            game.handle_roll(player, roll)
+            turns += 1
+            game.advance_turn()
+            time.sleep(0.2)
+        except KeyboardInterrupt:
+            print("\n👋 Exiting game.")
+            speak("Jumanji sleeps, for now.")
+            break
+        except SystemExit:
+            # A player won
+            break
+        except Exception as e:
+            print(f"⚠️ Non-fatal error: {e}")
+            time.sleep(0.5)
+
+if __name__ == "__main__":
+    main()
