@@ -1,0 +1,30 @@
+# pi_uart_servo_test.py
+# Uses /dev/serial0 (what you have). One-wire: Pi TX only.
+
+import time
+import serial
+
+PORT = "/dev/serial0"
+BAUD = 115200
+
+def send(line):
+    with serial.Serial(PORT, BAUD, timeout=0.2) as ser:
+        time.sleep(0.2)
+        ser.write((line.strip() + "\n").encode())
+        ser.flush()
+    print("sent:", line)
+
+def main():
+    print("Pi -> ESP32 UART servo test")
+    # long-ish pulses so you can clearly see movement
+    send("MOVE FWD 800")
+    time.sleep(1.2)
+    send("MOVE REV 800")
+    time.sleep(1.2)
+    send("MOVE FWD 500")
+    time.sleep(0.8)
+    send("MOVE REV 500")
+    print("done.")
+
+if __name__ == "__main__":
+    main()
