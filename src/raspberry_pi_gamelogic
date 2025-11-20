@@ -22,7 +22,7 @@ LATEST_PATH = "/tmp/jumanji_latest_roll.txt"      # (optional) last roll only
 
 # Gemini
 GEMINI_MODEL   = "gemini-2.5-flash"
-GOOGLE_API_KEY = "AIzaSyAzZ4WmrihxILI_904vDqDcH7f0yRSJvNY"
+GOOGLE_API_KEY = "********"
 
 # ----------------- GPIO PINS -----------------
 START_PIN   = 17         # ESP32 -> Pi signal (BCM17, physical pin 11)
