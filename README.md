@@ -33,18 +33,6 @@ The system uses two ESP32 boards, a Raspberry Pi, a BLE-enabled dice, ultrasonic
 
 More details:
 
-- Wiring diagram:  
-  `hardware/wiring_diagram.png`  
----
 
-## Repository Structure
 
-```text
-src/
-  esp32_main/      # Main ESP32 code for sensors, servos, LEDs
-  raspberry_pi/    # Raspberry Pi logic, AI integration, communication
-  ble_die/         # BLE dice ESP32 Xiao code
 
-hardware/
-  wiring_diagram.png      # Main wiring diagram
-  CAD files      # used to 3D print the board
