@@ -31,7 +31,7 @@ The system uses two ESP32 boards, a Raspberry Pi, a BLE-enabled dice, ultrasonic
 - LEDs for feedback and player presence indication  
 - Push buttons for player input  
 
-More details:
+Check out the repository for codes, 3D STL files and wiring diagram
 
 
 
